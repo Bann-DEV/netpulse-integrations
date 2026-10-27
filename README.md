@@ -11,16 +11,18 @@ This keeps the NetPulse server small and avoids shipping code for hardware the c
 | Directory | Transport | Coverage |
 |---|---|---|
 | `routeros/` | RouterOS binary API, REST fallback | System, ports, DHCP, ARP, FDB, temperature, firmware state, flash and WAN rates |
+| `asuswrt/` | Portable probes on Asuswrt/Merlin | System, wireless, DHCP, ARP, FDB, LLDP, interfaces and WAN data exposed by the firmware |
 
 ## Install
 
 Build the agent you need. The binaries are static Go programs and do not require Docker.
 
 ```sh
-go build -o routeros-pusher ./routeros/cmd/routeros-pusher
+CGO_ENABLED=0 go build -o routeros-pusher ./routeros/cmd/routeros-pusher
+CGO_ENABLED=0 go build -o asuswrt-pusher ./asuswrt/cmd/asuswrt-pusher
 ```
 
-Create an external router in NetPulse, obtain its agent token and run the pusher with its environment variables. Each integration README documents the variables, the systemd unit and the data it collects.
+Create an external router in NetPulse, obtain its agent token and run the pusher with its environment variables. Each integration README documents the variables, service or boot setup, upgrades and collected data.
 
 The ingest contract, authentication, payload semantics and contribution rules are in the NetPulse guide:
 
@@ -36,7 +38,7 @@ go vet ./...
 go test ./...
 ```
 
-CI runs the same checks for every pull request.
+CI runs the same checks, race-enabled tests and static builds for every pull request. Tags such as `routeros/v0.1.0` and `asuswrt/v0.1.0` run the tests and publish a static Linux binary tarball with its SHA-256 file. RouterOS releases currently target amd64 and Asuswrt releases target ARM64.
 
 ## Adding an integration
 
@@ -45,7 +47,7 @@ CI runs the same checks for every pull request.
 3. Keep vendor credentials and parsing inside that directory. Ask NetPulse maintainers for neutral contract fields before depending on them.
 4. Include fixtures, tests and evidence from real hardware.
 5. Add a `CODEOWNERS` entry for the directory. The owner of the hardware maintains it and validates releases.
-6. Tag releases per integration, for example `routeros/v0.1.0`.
+6. Tag releases per integration, for example `routeros/v0.1.0`. The release workflow tests the repository and publishes the documented platform asset. Validate the integration on real hardware before tagging.
 
 The maintainer of this repository decides who owns each directory. Directory ownership is not transferred by sending a pull request.
 
