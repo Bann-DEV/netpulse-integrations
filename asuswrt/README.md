@@ -80,4 +80,18 @@ Logs go to stderr through `slog`. A successful cycle logs `asuswrt-pusher: pushe
 
 ## Hardware validation
 
-The portable probe fixtures include an ASUS GT-BE98 Pro with RT-AX92U mesh nodes. The external command has configuration and transport tests, but it still requires an on-router validation pass before its first tagged release. Record the firmware, architecture, push interval, available sections and any gaps with that validation.
+The portable probe fixtures include an ASUS GT-BE98 Pro with RT-AX92U mesh nodes. Both have now been validated on the routers themselves, read-only, with a static ARM64 binary built with the flags above and `NETPULSE_INTERVAL=20s`.
+
+| Unit | Firmware | Kernel / arch / RAM | Sections collected | Absent, and why |
+|---|---|---|---|---|
+| GT-BE98 Pro | ASUSWRT-Merlin (KoolShare build), firmware `102.8-0` | Linux 4.19.294 aarch64, 2 GiB | `system` (cpu, temp, uptime, memory, timezone, bridge MAC), `wireless` (18 clients, 9 own BSSIDs, radios `2.4 GHz ch11/20 MHz`, `5 GHz ch48/160 MHz`, `6 GHz ch323/20 MHz`, `6 GHz ch195/20 MHz`), `fdb` (`wan` and `eth1` up at 10 Gbps), `arp` (34) with `arpDevs`/`arpStale`, `netIf` (33), `lldp` (neighbor `XS708T` on `xg3`), `clientBw`, `discovery` (11 neighbor BSS) | `dhcp`: the unit exposes no DHCP lease table to the probes; `wan`: it is polled as an access point, not a WAN edge |
+| RT-AX92U (AiMesh node) | ASUSWRT-Merlin (KoolShare build), kernel build of 2025-11-19 | Linux 4.1.51 aarch64, 384 MiB | `system`, `wireless` (5 clients, radios `5 GHz ch149/80 MHz`, `5 GHz ch48/80 MHz`, `2.4 GHz ch11/20 MHz`), `fdb`, `arp` (42) with `arpDevs`/`arpStale`, `netIf` (27), `lldp` (neighbor `GS728TXP` on `1/g11`), `clientBw` | same as above; a mesh node runs no DHCP service, so `dhcp` is absent rather than empty |
+
+Known gaps on this family:
+
+- `powerDbm` is always 0 on Broadcom. `wl txpower` answers "Unsupported" and there is no nvram value, so the radio panel shows an em dash instead of a number.
+- Wireless data depends on the probe carrying the `wl` tier: with a probe pin that predates it, the RT-AX92U payload had `wireless.clients` empty and all three radios with empty name, channel 0 and 0 MHz width, while `iw`/nl80211 still reported no stations on Broadcom dhd. The same unit after the current pin reports the band, channel, width and the 5 associated clients above.
+- Memory, not correctness: the pusher reserves about 1.2 GiB of Go heap arena. On the 384 MiB RT-AX92U it has to run **instead of** the native agent — one pusher plus one agent plus a second pusher died at startup with `out of memory allocating heap arena map`. On the 2 GiB GT-BE98 Pro both ran at the same time.
+- HTTPS only, and unrelated to the probes: against the certificate NetPulse generates (issued for `127.0.0.1`), the shared transport fails every cycle with `x509: certificate is valid for 127.0.0.1, ::1, not <lan-ip>` until it can pin the server's SPKI — that is the subject of PR #9, and the validation runs below used a build with it applied.
+
+Each validation run used a temporary `external` registration which was deleted afterwards, and the router's native agent was restarted and confirmed `fresh=true` on the server.
