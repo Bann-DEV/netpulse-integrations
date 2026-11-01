@@ -79,11 +79,15 @@ func TestBuildPayloadRejectsBadCPU(t *testing.T) {
 }
 
 func TestRouterOSPortsOnlyPhysicalEthernet(t *testing.T) {
-	ports := routerOSPorts([]map[string]string{
-		{"name": "ether1", "type": "ether", "running": "true"},
-		{"name": "bridge", "type": "bridge"},
-		{"name": "ether2", "type": "ether", "running": "false"},
+	samples, err := routerOSEtherSamples([]map[string]string{
+		{"name": "ether1", "type": "ether", "running": "true", "rx-byte": "10", "tx-byte": "20"},
+		{"name": "bridge", "type": "bridge", "rx-byte": "1", "tx-byte": "2"},
+		{"name": "ether2", "type": "ether", "running": "false", "rx-byte": "0", "tx-byte": "0"},
 	})
+	if err != nil {
+		t.Fatalf("routerOSEtherSamples: %v", err)
+	}
+	ports := routerOSPorts(samples)
 	if len(ports) != 2 {
 		t.Fatalf("ports = %+v, want 2", ports)
 	}
@@ -104,7 +108,11 @@ func TestRouterOSPortsCarryThePrintedCounters(t *testing.T) {
 		{"name": "sfp-sfpplus3", "type": "ether", "running": "false", "rx-byte": "0", "tx-byte": "0"},
 		{"name": "bridge", "type": "bridge", "running": "true", "rx-byte": "999", "tx-byte": "888"},
 	}
-	ports := routerOSPorts(rows)
+	samples, err := routerOSEtherSamples(rows)
+	if err != nil {
+		t.Fatalf("routerOSEtherSamples: %v", err)
+	}
+	ports := routerOSPorts(samples)
 	if len(ports) != 4 {
 		t.Fatalf("ports = %d, want 4 (physical ether only)", len(ports))
 	}
@@ -118,15 +126,76 @@ func TestRouterOSPortsCarryThePrintedCounters(t *testing.T) {
 		t.Fatalf("a down port carries no counters and no speed: %+v", ports[0])
 	}
 
-	netIf := routerOSNetIf(rows)
-	if len(netIf) != 2 {
-		t.Fatalf("netIf = %+v, want the two ports with traffic", netIf)
+	netIf := routerOSNetIf(samples)
+	if len(netIf) != 4 {
+		t.Fatalf("netIf = %+v, want all four bocas, idle ones included", netIf)
 	}
 	if netIf["sfp-sfpplus1"].Rx != 440039183288 || netIf["sfp-sfpplus2"].Tx != 428475245997 {
 		t.Fatalf("netIf counters = %+v", netIf)
 	}
+	// The zero-counting bocas have to stay in the map: the server diffs this
+	// payload against the previous one, so an idle port dropped from the sample
+	// loses the baseline its next rate is computed from (and a counter reset
+	// looks exactly like this).
+	if idle, ok := netIf["ether1"]; !ok || idle.Rx != 0 || idle.Tx != 0 {
+		t.Fatalf("idle boca = %+v (present=%v), want a zeroed baseline", idle, ok)
+	}
+	if _, ok := netIf["sfp-sfpplus3"]; !ok {
+		t.Fatal("the down sfp cage must keep its baseline too")
+	}
 	if _, ok := netIf["bridge"]; ok {
 		t.Fatal("the bridge is not a boca; only the reported ports belong in netIf")
+	}
+}
+
+// A counter that cannot be read must reject the sample rather than become a
+// real zero: a synthetic zero is stored as the new baseline, and the next valid
+// counter then reports the whole lifetime of the port as one interval's traffic.
+func TestRouterOSEtherSamplesRejectsUnusableCounters(t *testing.T) {
+	for name, rows := range map[string][]map[string]string{
+		"missing rx":     {{"name": "ether1", "type": "ether", "running": "true", "tx-byte": "10"}},
+		"missing tx":     {{"name": "ether1", "type": "ether", "running": "true", "rx-byte": "10"}},
+		"malformed rx":   {{"name": "ether5", "type": "ether", "rx-byte": "n/a", "tx-byte": "10"}},
+		"negative tx":    {{"name": "ether5", "type": "ether", "rx-byte": "10", "tx-byte": "-1"}},
+		"overflowing rx": {{"name": "ether6", "type": "ether", "rx-byte": "18446744073709551616", "tx-byte": "0"}},
+	} {
+		_, err := routerOSEtherSamples(rows)
+		if err == nil {
+			t.Errorf("%s: want an error, got none", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), rows[0]["name"]) {
+			t.Errorf("%s: error must name the port, got: %v", name, err)
+		}
+	}
+	// Only physical rows are validated: a bridge or vlan row is not a boca, and
+	// failing on it would hold the whole payload hostage to a section that never
+	// feeds the port panel.
+	if _, err := routerOSEtherSamples([]map[string]string{{"name": "bridge", "type": "bridge"}}); err != nil {
+		t.Fatalf("a bridge row without counters must not fail the poll: %v", err)
+	}
+}
+
+// The same rejection seen end to end: an unusable counter fails the poll with
+// nothing pushed, instead of a payload carrying a fabricated zero baseline.
+func TestPollAPIFailsWhenInterfaceCountersAreUnusable(t *testing.T) {
+	poller, _ := fakeAPIPoller(t, func(cmd string) [][]byte {
+		if cmd == "/interface/print" {
+			return [][]byte{
+				testSentence("!re", "=name=ether1", "=type=ether", "=running=true", "=mac-address=aa:bb:cc:dd:ee:01"),
+				testSentence("!done"),
+			}
+		}
+		return fixtureAPIReplies()[cmd]
+	}, 2*time.Second)
+
+	data, err := poller.pollAPI(context.Background())
+	requireRetryable(t, err)
+	if data != nil {
+		t.Fatalf("pollAPI pushed a payload with an unreadable counter: %+v", data)
+	}
+	if !strings.Contains(err.Error(), "ether1") || !strings.Contains(err.Error(), "rx-byte") {
+		t.Fatalf("error must name the port and the missing counter, got: %v", err)
 	}
 }
 
@@ -293,6 +362,17 @@ func TestPollAPIReturnsFullPayload(t *testing.T) {
 		data.FDB.MACs["AA:BB:CC:DD:EE:11"] != "ether1" ||
 		len(data.FDB.Ports) != 1 || !data.FDB.Ports[0].Up {
 		t.Fatalf("fdb = %+v", data.FDB)
+	}
+	// The counters reach both structures from one validated read: the boca
+	// carries them and netIf reports the same pair the server will diff.
+	if data.FDB.Ports[0].RxBytes != 1000 || data.FDB.Ports[0].TxBytes != 2000 {
+		t.Fatalf("port counters = %d/%d", data.FDB.Ports[0].RxBytes, data.FDB.Ports[0].TxBytes)
+	}
+	if data.NetIf == nil || len(data.NetIf) != 1 {
+		t.Fatalf("netIf = %+v, want the one physical boca", data.NetIf)
+	}
+	if data.NetIf["ether1"].Rx != 1000 || data.NetIf["ether1"].Tx != 2000 {
+		t.Fatalf("netIf counters = %+v, want the 1000/2000 the print carried", data.NetIf["ether1"])
 	}
 	if data.DHCP == nil || len(data.DHCP.Leases) != 1 || data.DHCP.Leases[0].MAC != "AA:BB:CC:DD:EE:11" {
 		t.Fatalf("dhcp = %+v", data.DHCP)
@@ -633,7 +713,8 @@ func fixtureAPIReplies() map[string][][]byte {
 		},
 		"/system/identity/print": {testSentence("!re", "=name=core-router"), done},
 		"/interface/print": {
-			testSentence("!re", "=name=ether1", "=type=ether", "=running=true", "=mac-address=aa:bb:cc:dd:ee:01"),
+			testSentence("!re", "=name=ether1", "=type=ether", "=running=true", "=mac-address=aa:bb:cc:dd:ee:01",
+				"=rx-byte=1000", "=tx-byte=2000"),
 			testSentence("!re", "=name=bridge", "=type=bridge", "=running=true", "=mac-address=aa:bb:cc:dd:ee:00"),
 			done,
 		},

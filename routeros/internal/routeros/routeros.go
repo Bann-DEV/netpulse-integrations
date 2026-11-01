@@ -653,13 +653,17 @@ func (p *Poller) pollAPI(ctx context.Context) (*probe.PayloadData, error) {
 		return nil, err
 	}
 	sys.BridgeMAC = routerOSBridgeMAC(ifRows)
+	samples, err := routerOSEtherSamples(ifRows)
+	if err != nil {
+		return nil, err
+	}
 	data.FDB = &probe.FDBData{
 		MACs:  map[string]string{},
-		Ports: routerOSPorts(ifRows),
+		Ports: routerOSPorts(samples),
 	}
 	// #305 contract: the payload carries absolute counters per iface and the
 	// server does the delta, which is what turns a boca into a rate.
-	data.NetIf = routerOSNetIf(ifRows)
+	data.NetIf = routerOSNetIf(samples)
 	leaseRows, err := conn.queryRows("/ip/dhcp-server/lease/print")
 	if err != nil {
 		return nil, err
@@ -785,47 +789,79 @@ func routerOSWANInterface(routeRows []map[string]string) string {
 	return ""
 }
 
-func routerOSPorts(rows []map[string]string) []probe.EthPort {
-	ports := make([]probe.EthPort, 0, len(rows))
+// etherSample is one physical ethernet row of /interface/print with its
+// counters already parsed. The port table and the #305 netIf section have to
+// agree on the same numbers, so both are built from this one read instead of
+// parsing the same row twice.
+type etherSample struct {
+	name string
+	up   bool
+	rx   uint64
+	tx   uint64
+}
+
+// routerOSEtherSamples picks the physical ether rows out of the interface
+// print. A missing or unparsable counter is an error rather than a zero: a
+// synthetic zero becomes the new baseline and inflates the next valid delta, so
+// the sample is rejected the way every other failed query is, retryable and
+// pushing nothing. Measured on RouterOS 7.25 (CRS305-1G-4S+): every ether row
+// carries both words, down and idle ports included ("rx-byte=0 tx-byte=0"), so
+// a healthy router never reaches this branch.
+func routerOSEtherSamples(rows []map[string]string) ([]etherSample, error) {
+	var samples []etherSample
 	for _, row := range rows {
 		if row["type"] != "ether" {
 			continue
 		}
-		name := row["name"]
-		rx, _ := strconv.ParseUint(row["rx-byte"], 10, 64)
-		tx, _ := strconv.ParseUint(row["tx-byte"], 10, 64)
+		rx, errRx := strconv.ParseUint(row["rx-byte"], 10, 64)
+		tx, errTx := strconv.ParseUint(row["tx-byte"], 10, 64)
+		if errRx != nil || errTx != nil {
+			return nil, fmt.Errorf("routeros: /interface/print port %q: rx-byte=%q tx-byte=%q, want two counters",
+				row["name"], row["rx-byte"], row["tx-byte"])
+		}
+		samples = append(samples, etherSample{
+			name: row["name"],
+			up:   row["running"] == "true",
+			rx:   rx,
+			tx:   tx,
+		})
+	}
+	return samples, nil
+}
+
+func routerOSPorts(samples []etherSample) []probe.EthPort {
+	ports := make([]probe.EthPort, 0, len(samples))
+	for _, s := range samples {
 		ports = append(ports, probe.EthPort{
-			ID:      name,
-			Label:   name,
-			Up:      row["running"] == "true",
-			Iface:   name,
-			RxBytes: rx,
-			TxBytes: tx,
-			// Speed stays empty on purpose: RouterOS keeps the negotiated
-			// rate in /interface/ethernet, and that menu never answers over
-			// the binary API (it does not even trap; it just stops replying).
+			ID:      s.name,
+			Label:   s.name,
+			Up:      s.up,
+			Iface:   s.name,
+			RxBytes: s.rx,
+			TxBytes: s.tx,
+			// Speed is not in a print at all: RouterOS reports the negotiated
+			// rate from /interface/ethernet/monitor, per port. That read, and
+			// the SFP diagnosis and error counters that come with it, are a
+			// separate change; until then the server shows the boca without a
+			// rate rather than an invented one.
 		})
 	}
 	return ports
 }
 
-// routerOSNetIf mirrors the same absolute counters as #305 expects: the
-// payload carries counters, the server does the delta between pushes.
-func routerOSNetIf(rows []map[string]string) map[string]probe.IfCounters {
-	var out map[string]probe.IfCounters
-	for _, row := range rows {
-		if row["type"] != "ether" {
-			continue
-		}
-		rx, _ := strconv.ParseUint(row["rx-byte"], 10, 64)
-		tx, _ := strconv.ParseUint(row["tx-byte"], 10, 64)
-		if rx == 0 && tx == 0 {
-			continue
-		}
-		if out == nil {
-			out = map[string]probe.IfCounters{}
-		}
-		out[row["name"]] = probe.IfCounters{Rx: rx, Tx: tx}
+// routerOSNetIf reports the absolute counters of every physical port, including
+// the one reading zero on both sides. An idle boca that is left out of the map
+// deletes the baseline the server diffs against, so the next nonzero sample
+// either has no rate at all or is measured against an older sample; the same
+// applies right after a counter reset, which is how a healthy port looks again
+// for one cycle.
+func routerOSNetIf(samples []etherSample) map[string]probe.IfCounters {
+	if len(samples) == 0 {
+		return nil
+	}
+	out := make(map[string]probe.IfCounters, len(samples))
+	for _, s := range samples {
+		out[s.name] = probe.IfCounters{Rx: s.rx, Tx: s.tx}
 	}
 	return out
 }
